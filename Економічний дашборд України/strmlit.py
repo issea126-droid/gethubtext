@@ -3,8 +3,6 @@ import pandas as pd
 import requests
 import altair as alt
 from datetime import datetime
-from sklearn.linear_model import LinearRegression
-import numpy as np
 
 st.set_page_config(page_title="Економічний дашборд України", layout="wide")
 
@@ -85,8 +83,6 @@ with col1:
         default=["GDP (US$)"]
     )
     show_table = st.checkbox("Показати таблицю даних", value=False)
-    show_corr = st.checkbox("Показати кореляцію між метриками", value=True)
-    show_forecast = st.checkbox("Показати прогноз на 6 років", value=True)
 
 with col2:
     st.subheader("Огляд")
@@ -128,51 +124,6 @@ with col2:
 
             st.altair_chart(chart, use_container_width=True)
 
-        # --- Кореляція ---
-        if show_corr and len(selected_metrics) >= 2:
-            metric_map = {"GDP (US$)":"NY.GDP.MKTP.CD",
-                          "Inflation (annual %)":"FP.CPI.TOTL.ZG",
-                          "Unemployment (%)":"SL.UEM.TOTL.ZS"}
-            cols = [metric_map[m] for m in selected_metrics]
-            corr = df_viz[cols].corr()
-            st.subheader("Кореляція між показниками")
-            st.dataframe(corr.style.format("{:.2f}"))
-
-        # --- Прогноз ---
-        if show_forecast and len(selected_metrics) >= 1:
-            st.subheader("Прогноз на 6 років (лінійна екстраполяція)")
-            forecast_df = pd.DataFrame({'year': df_viz['year']})
-            future_years = np.arange(df_viz['year'].max()+1, df_viz['year'].max()+7)
-            forecast_df = pd.concat([forecast_df, pd.DataFrame({'year': future_years})], ignore_index=True)
-
-            forecast_long = pd.DataFrame()
-            for metric in selected_metrics:
-                y_col = metric_map[metric]
-                df_metric = df_viz[['year', y_col]].dropna()
-                if df_metric.empty:
-                    continue
-                model = LinearRegression()
-                X = df_metric['year'].values.reshape(-1,1)
-                y = df_metric[y_col].values
-                model.fit(X, y)
-                forecast_values = model.predict(forecast_df['year'].values.reshape(-1,1))
-                temp = pd.DataFrame({
-                    'year': forecast_df['year'],
-                    'value': forecast_values,
-                    'metric': metric
-                })
-                forecast_long = pd.concat([forecast_long, temp])
-
-            chart_forecast = alt.Chart(forecast_long).mark_line(point=True, strokeDash=[5,3]).encode(
-                x=alt.X('year:O', title='Year'),
-                y=alt.Y('value:Q', title='Value'),
-                color='metric:N',
-                tooltip=['year', 'metric', alt.Tooltip('value:Q', format=',.2f')]
-            ).interactive().properties(height=300)
-
-            st.altair_chart(chart_forecast, use_container_width=True)
-
-        # --- Таблиця та CSV ---
         if show_table:
             st.dataframe(df_viz)
 
