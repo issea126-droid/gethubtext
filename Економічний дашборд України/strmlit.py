@@ -1,194 +1,172 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import requests
-import io
+import altair as alt
 from datetime import datetime
-import plotly.express as px
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-import statsmodels.api as sm
 
-st.set_page_config(layout="wide", page_title="Економічний дашборд України")
+st.set_page_config(page_title="Економічний дашборд України", layout="wide")
 
-st.title("Економічний дашборд України 🇺🇦")
-st.markdown(
-    "Коротко: завантажуємо відкриті дані (World Bank / державні API), будуємо інтерактивні графіки, кореляції та прогноз на 6 місяців."
-)
+# ----------------------
+# Helper: World Bank API
+# ----------------------
+WB_BASE = "https://api.worldbank.org/v2/country/UA/indicator/{}"
 
-# ---------------------------
-# Helper: World Bank API fetch
-# ---------------------------
-WB_BASE = "https://api.worldbank.org/v2/country/UA/indicator/{indicator}?format=json&per_page=1000"
-
-INDICATORS = {
-    "GDP (current US$)": "NY.GDP.MKTP.CD",
-    "Inflation (CPI, annual %)": "FP.CPI.TOTL.ZG",
-    "Unemployment rate (% of labor force)": "SL.UEM.TOTL.ZS",
-}
-
-@st.cache_data(show_spinner=False)
-def fetch_wb_series(indicator_code):
-    url = WB_BASE.format(indicator=indicator_code)
-    r = requests.get(url, timeout=20)
+@st.cache_data(ttl=60*60)
+def fetch_worldbank_indicator(indicator_code, per_page=1000):
+    """Fetch an indicator for Ukraine from the World Bank API and return a tidy DataFrame.
+    indicator_code examples:
+      - NY.GDP.MKTP.CD  -> GDP (current US$)
+      - FP.CPI.TOTL.ZG  -> Inflation, consumer prices (annual %)
+      - SL.UEM.TOTL.ZS  -> Unemployment, total (% of total labor force)
+    """
+    url = WB_BASE.format(indicator_code)
+    params = {"format": "json", "per_page": per_page}
+    r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
-    data = r.json()
-    # data[1] contains observations
-    if len(data) < 2 or not data[1]:
-        return pd.DataFrame(columns=["date", "value"])
-    records = []
-    for item in data[1]:
-        year = item.get('date')
-        val = item.get('value')
-        if val is not None:
-            try:
-                records.append({"date": pd.to_datetime(f"{year}-01-01"), "value": float(val)})
-            except Exception:
-                continue
-    df = pd.DataFrame(records).sort_values('date').reset_index(drop=True)
-    return df
+    payload = r.json()
 
-# Sidebar controls
-st.sidebar.header("Налаштування")
-indicators_selected = st.sidebar.multiselect("Показники (джерело: World Bank)", list(INDICATORS.keys()), default=list(INDICATORS.keys()))
-start_year = st.sidebar.number_input("Рік початку:", min_value=1960, max_value=datetime.now().year, value=2000, step=1)
-show_interpolated = st.sidebar.checkbox("Інтерполювати до місяців (щоб дати прогноз, 6 місяців)", value=True)
-
-# Fetch data
-series_dfs = {}
-for name in indicators_selected:
-    code = INDICATORS[name]
-    df = fetch_wb_series(code)
-    if not df.empty:
-        df = df[df['date'].dt.year >= int(start_year)].copy()
-    series_dfs[name] = df
-
-# Show data availability
-st.subheader("Джерела та доступні часові ряди")
-col1, col2 = st.columns([2,1])
-with col1:
-    for name, df in series_dfs.items():
-        if df.empty:
-            st.warning(f"{name}: дані не знайдені для вибраних параметрів")
-        else:
-            st.write(f"**{name}** — період: {df['date'].dt.year.min()} — {df['date'].dt.year.max()} ({len(df)} записів)")
-with col2:
-    if st.button("Оновити всі", use_container_width=True):
-        st.cache_data.clear()
-        st.experimental_rerun()
-
-# Prepare monthly series if asked
-monthly = {}
-for name, df in series_dfs.items():
+    # payload[1] contains data rows
+    rows = payload[1] if len(payload) > 1 else []
+    df = pd.DataFrame(rows)
     if df.empty:
-        monthly[name] = pd.Series(dtype=float)
-        continue
-    df = df.set_index('date').sort_index()
-    # convert yearly to monthly by forward/backward fill or linear interpolation
-    if show_interpolated:
-        idx = pd.date_range(start=df.index.min(), end=df.index.max(), freq='MS')
-        s = df['value'].reindex(pd.to_datetime(df.index)).sort_index()
-        s_monthly = s.resample('YS').first() if False else s  # keep as-is
-        # create monthly series by linear interpolation on year values
-        yearly = df['value']
-        yearly.index = pd.DatetimeIndex([pd.Timestamp(f'{d.year}-01-01') for d in yearly.index])
-        monthly_index = pd.date_range(yearly.index.min(), yearly.index.max(), freq='MS')
-        monthly_series = yearly.reindex(monthly_index, method=None)
-        monthly_series = monthly_series.interpolate(method='linear')
-        monthly[name] = monthly_series
-    else:
-        monthly[name] = df['value']
+        return pd.DataFrame()
 
-# Plot interactive charts
-st.subheader("Інтерактивні графіки")
-chart_col1, chart_col2 = st.columns(2)
-with chart_col1:
-    sel = st.selectbox("Оберіть показник для графіка (ліва панель)", indicators_selected, index=0)
-    s = monthly.get(sel, pd.Series())
-    if s.empty:
-        st.info("Немає даних для візуалізації")
-    else:
-        fig = px.line(x=s.index, y=s.values, labels={'x':'Дата', 'y':sel}, title=sel)
-        st.plotly_chart(fig, use_container_width=True)
-with chart_col2:
-    sel2 = st.selectbox("Оберіть показник для графіка (права панель)", indicators_selected, index=min(1, max(0, len(indicators_selected)-1)))
-    s2 = monthly.get(sel2, pd.Series())
-    if s2.empty:
-        st.info("Немає даних для візуалізації")
-    else:
-        fig2 = px.line(x=s2.index, y=s2.values, labels={'x':'Дата', 'y':sel2}, title=sel2)
-        st.plotly_chart(fig2, use_container_width=True)
+    # Clean and select columns we want
+    df = df[["date", "value", "indicator"]]
+    df["date"] = df["date"].astype(int)
+    df.rename(columns={"value": indicator_code}, inplace=True)
+    df[indicator_code] = pd.to_numeric(df[indicator_code], errors="coerce")
+    return df.sort_values("date")
 
-# Correlations
-st.subheader("Кореляції між показниками")
-# build DataFrame with aligned indices
-aligned = pd.DataFrame()
-for name, s in monthly.items():
-    if s.empty:
-        continue
-    aligned[name] = s
-aligned = aligned.dropna()
-if aligned.empty or aligned.shape[1] < 2:
-    st.info("Недостатньо перехресних даних для кореляції")
-else:
-    corr = aligned.corr()
-    st.write("Матриця кореляцій (Пірсон):")
-    st.dataframe(corr.style.format(precision=3))
-    heatmap_fig = px.imshow(corr.values, x=corr.columns, y=corr.index, text_auto='.3f', title='Кореляційна матриця')
-    st.plotly_chart(heatmap_fig, use_container_width=True)
+# ----------------------
+# Load data
+# ----------------------
+st.sidebar.title("Налаштування джерел даних")
+use_worldbank = st.sidebar.checkbox("Використовувати World Bank API (за замовчуванням)", value=True)
 
-# Forecasting: simple SARIMAX per series
-st.subheader("Прогноз на 6 місяців")
-forecast_col1, forecast_col2 = st.columns([2,1])
-with forecast_col1:
-    to_forecast = st.selectbox("Який показник прогнозувати?", indicators_selected)
-    s = monthly.get(to_forecast, pd.Series())
-    if s.empty or len(s.dropna()) < 12:
-        st.warning("Недостатньо даних (потрібно щонайменше ~12 місячних спостережень). Пробуйте інший показник або зніміть інтерполяцію.")
-    else:
-        # fit SARIMAX (simple defaults) on the series
-        y = s.dropna()
+# optional: placeholders for alternative APIs
+st.sidebar.markdown("---")
+st.sidebar.write("Інші джерела (опційно): NBU / StateStatistics / TradingEconomics — потребують API-ключі або інший формат.")
+
+if not use_worldbank:
+    st.warning("Ви відключили World Bank API. Дашборд поки що підтримує World Bank як основне джерело. Увімкніть його або розширте код для інших API.")
+
+with st.spinner("Завантаження даних..."):
+    if use_worldbank:
         try:
-            model = SARIMAX(y, order=(1,1,1), seasonal_order=(0,0,0,0), enforce_stationarity=False, enforce_invertibility=False)
-            res = model.fit(disp=False)
-            pred = res.get_forecast(steps=6)
-            pred_mean = pred.predicted_mean
-            pred_ci = pred.conf_int()
+            gdp = fetch_worldbank_indicator("NY.GDP.MKTP.CD")
+            inflation = fetch_worldbank_indicator("FP.CPI.TOTL.ZG")
+            unemployment = fetch_worldbank_indicator("SL.UEM.TOTL.ZS")
 
-            # plot
-            figf = px.line()
-            figf.add_scatter(x=y.index, y=y.values, mode='lines', name='Історія')
-            figf.add_scatter(x=pred_mean.index, y=pred_mean.values, mode='lines', name='Прогноз (6 міс.)')
-            figf.update_layout(title=f'Прогноз для {to_forecast} на 6 місяців')
-            st.plotly_chart(figf, use_container_width=True)
+            # merge into one dataframe by date
+            dfs = [gdp, inflation, unemployment]
+            df_merged = None
+            for d in dfs:
+                if df_merged is None:
+                    df_merged = d
+                else:
+                    df_merged = pd.merge(df_merged, d, on=["date", "indicator"], how="outer")
 
-            st.write("Прогнозні значення:")
-            df_pred = pd.DataFrame({"date": pred_mean.index, "forecast": pred_mean.values})
-            st.dataframe(df_pred.set_index('date').round(3))
+            # The merge approach above keeps indicator column duplicated; instead rebuild tidy table
+            df = pd.DataFrame({"year": sorted(set(gdp["date"].tolist() + inflation["date"].tolist() + unemployment["date"].tolist()))})
+            df = df.set_index("year")
 
+            def series_from(ind_df, code):
+                if ind_df.empty:
+                    return pd.Series(dtype=float)
+                s = ind_df.set_index("date")[code]
+                s.index = s.index.astype(int)
+                return s
+
+            df = df.join(series_from(gdp, "NY.GDP.MKTP.CD"), how="left")
+            df = df.join(series_from(inflation, "FP.CPI.TOTL.ZG"), how="left")
+            df = df.join(series_from(unemployment, "SL.UEM.TOTL.ZS"), how="left")
+            df.reset_index(inplace=True)
+            df.rename(columns={"index": "year"}, inplace=True)
+            df["year"] = df["year"].astype(int)
+            df.sort_values("year", inplace=True)
         except Exception as e:
-            st.error(f"Помилка під час побудови моделі: {e}")
+            st.error(f"Помилка при завантаженні даних: {e}")
+            df = pd.DataFrame()
+    else:
+        df = pd.DataFrame()
 
-with forecast_col2:
-    if st.button("Завантажити CSV (усі серії)"):
-        # prepare combined CSV from original yearly + interpolated monthly
-        out = io.StringIO()
-        combined = pd.DataFrame()
-        for name, s in monthly.items():
-            combined[name] = s
-        combined.to_csv(out)
-        st.download_button("Download CSV", data=out.getvalue().encode('utf-8'), file_name='ukraine_econ_series.csv', mime='text/csv')
+# ----------------------
+# UI layout
+# ----------------------
+st.title("📊 Економічний дашборд України")
+st.markdown("Дані завантажуються з відкритих API (World Bank). Ви можете розширити джерела у коді.")
 
-# Help / how to run
+col1, col2 = st.columns([1, 3])
+with col1:
+    st.subheader("Фільтри")
+    years = df["year"].dropna().astype(int).tolist() if not df.empty else []
+    if years:
+        min_year = int(min(years))
+        max_year = int(max(years))
+        selected_range = st.slider("Рік (діапазон):", min_value=min_year, max_value=max_year, value=(max_year-10 if max_year-10>min_year else min_year, max_year))
+    else:
+        selected_range = (2000, datetime.now().year)
+
+    metric = st.radio("Метрика:", ("GDP (US$)", "Inflation (annual %)", "Unemployment (%)"))
+    show_table = st.checkbox("Показати таблицю даних", value=False)
+    st.markdown("---")
+    st.markdown("**Поради:** Ви можете завантажити CSV нижче або додати додаткові показники (NBU, Stat.gov.ua).")
+
+with col2:
+    st.subheader("Огляд")
+    if df.empty:
+        st.info("Немає завантажених даних. Перевірте налаштування джерел або підключення до інтернету.")
+    else:
+        # KPI cards
+        latest = df.dropna(subset=["NY.GDP.MKTP.CD", "FP.CPI.TOTL.ZG", "SL.UEM.TOTL.ZS"]).iloc[-1:]
+        k1, k2, k3 = st.columns(3)
+        try:
+            k1.metric("GDP (current US$)", f"{int(latest['NY.GDP.MKTP.CD'].values[0]):,}")
+        except Exception:
+            k1.metric("GDP (current US$)", "—")
+        try:
+            k2.metric("Inflation (annual %)", f"{latest['FP.CPI.TOTL.ZG'].values[0]:.2f}%")
+        except Exception:
+            k2.metric("Inflation (annual %)", "—")
+        try:
+            k3.metric("Unemployment (%)", f"{latest['SL.UEM.TOTL.ZS'].values[0]:.2f}%")
+        except Exception:
+            k3.metric("Unemployment (%)", "—")
+
+        # Filter by selected range
+        yr_mask = (df["year"] >= int(selected_range[0])) & (df["year"] <= int(selected_range[1]))
+        df_viz = df.loc[yr_mask].copy()
+
+        # Choose metric to plot
+        if metric == "GDP (US$)":
+            y = "NY.GDP.MKTP.CD"
+            y_title = "GDP (current US$)"
+        elif metric == "Inflation (annual %)":
+            y = "FP.CPI.TOTL.ZG"
+            y_title = "Inflation, annual %"
+        else:
+            y = "SL.UEM.TOTL.ZS"
+            y_title = "Unemployment %"
+
+        chart = alt.Chart(df_viz).mark_line(point=True).encode(
+            x=alt.X('year:O', title='Year'),
+            y=alt.Y(f'{y}:Q', title=y_title),
+            tooltip=['year', alt.Tooltip(f'{y}:Q', format=',.2f')]
+        ).properties(height=400)
+
+        st.altair_chart(chart, use_container_width=True)
+
+        if show_table:
+            st.dataframe(df_viz)
+
+        # CSV download
+        csv = df.to_csv(index=False).encode('utf-8')
+        st.download_button("Завантажити CSV з усіма даними", data=csv, file_name='ukraine_economic_data.csv', mime='text/csv')
+
+# ----------------------
+# Footer / Notes
+# ----------------------
 st.markdown("---")
-st.header("Як розгорнути (швидко)")
-st.markdown(
-    "1. Створіть репозиторій на GitHub і додайте цей файл `ukraine_economic_dashboard.py` в корінь.\n"
-    "2. Додайте `requirements.txt` з переліком залежностей (streamlit, pandas, numpy, requests, plotly, statsmodels).\n"
-    "3. Запустіть локально: `pip install -r requirements.txt` -> `streamlit run ukraine_economic_dashboard.py`.\n"
-    "4. Для кращих (щомісячних) даних можна підключити TradingEconomics (має API key) або державні SDMX API — я добавив посилання на джерела у чаті."
-)
+st.caption("Дані (за замовчуванням) завантажуються через World Bank API: https://api.worldbank.org. Ви можете додати інші джерела як NBU або State Statistics (stat.gov.ua). Для реального часу або частіших оновлень розгляньте API TradingEconomics або власні ETL-процеси.")
 
-st.write("Готово — якщо хочете, можу згенерувати `requirements.txt` і `README.md` та підготувати інструкцію для GitHub Actions / Streamlit Community Cloud.")
-
-# Footer
-st.caption("Побудовано з даними World Bank (Indicators API). Для більш детальної / частішої (щомісячної) статистики рекомендується підключити TradingEconomics або державні SDMX API.")
